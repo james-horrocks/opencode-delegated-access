@@ -67,7 +67,6 @@
  *      longer races the notification.
  */
 
-import { define } from "@opencode-ai/plugin/v2/promise"
 import { parseConfig, type DelegatedAccessConfig } from "./config.ts"
 import {
   CLASSIFIER_SYSTEM_PROMPT,
@@ -96,6 +95,36 @@ import {
 import { SessionRepoContext } from "./session-repo-context.ts"
 import { sendNotification } from "./notify/notify.ts"
 import { childProcessShell } from "./v2-shell.ts"
+
+// ---------------------------------------------------------------------------
+// Local `define` helper (promise-API compatible).
+//
+// NOTE: this intentionally does NOT import "@opencode-ai/plugin/v2/promise"
+// at runtime. The vendored-directory install (nix store path) has no ancestor
+// node_modules chain, so the entry must run with ZERO external value
+// imports. Upstream's define is literally `function define(plugin) { return
+// plugin; }` (packages/plugin/src/promise/plugin.ts and every meridian
+// bundle) — an identity helper whose only purpose is a typed object literal.
+// Keep the structural typing in sync if the loader's server-side schema
+// for the default definition ever grows new required fields.
+// ---------------------------------------------------------------------------
+
+/**
+ * The server-side validation the OpenCode 2.x loader performs on the default
+ * export: an object with a string `id` and a `setup` (or `effect`) function.
+ * This type matches that surface without importing the (version-moving)
+ * npm types at runtime; value shape is unchanged from the upstream helper.
+ */
+export type PromisePluginDefinition = {
+  id: string
+  setup: (
+    context: unknown,
+  ) => Promise<(() => Promise<void>) | void> | (() => Promise<void>) | void
+}
+
+export function define<T extends PromisePluginDefinition>(plugin: T): T {
+  return plugin
+}
 
 // ---------------------------------------------------------------------------
 // Minimal structural types for the V2 promise plugin context we consume.
