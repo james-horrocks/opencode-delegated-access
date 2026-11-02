@@ -5,6 +5,7 @@ import {
   composeWithSystem,
   evaluationToInfo,
   normalizeV2RepliedProperties,
+  parseConfigV2,
   raceTimeout,
 } from "./v2.ts"
 
@@ -111,6 +112,33 @@ describe("composeWithSystem", () => {
     expect(merged.startsWith("SYSTEM-ROLE")).toBe(true)
     expect(merged.endsWith("USER-TASK")).toBe(true)
     expect(merged).toContain("SYSTEM-ROLE\n\n---\n\nUSER-TASK")
+  })
+})
+
+describe("parseConfigV2", () => {
+  it("returns the full V1 default set for undefined options", () => {
+    const cfg = parseConfigV2(undefined)
+    expect(cfg.enabled).toBe(true)
+    expect(cfg.contextMessageCount).toBe(3)
+    expect(cfg.safeCountdownMs).toBe(5000)
+    expect(cfg.classifierTimeoutMs).toBe(15000)
+    expect(cfg.classifierRetries).toBe(1)
+    expect(cfg.externalDirectoryEnabled).toBe(true)
+    expect(cfg.approvalHistoryMax).toBe(20)
+    expect(cfg.classifierModel).toBeUndefined()
+  })
+
+  it("clamps numbers into the V1 zod ranges and passes overrides through", () => {
+    const cfg = parseConfigV2({
+      contextMessageCount: 99,
+      classifierTimeoutMs: 10,
+      enabled: false,
+      classifierModel: "anthropic/claude-haiku-5-5",
+    })
+    expect(cfg.contextMessageCount).toBe(20)
+    expect(cfg.classifierTimeoutMs).toBe(500)
+    expect(cfg.enabled).toBe(false)
+    expect(cfg.classifierModel).toBe("anthropic/claude-haiku-5-5")
   })
 })
 

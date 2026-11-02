@@ -5,15 +5,27 @@
  *
  * OpenCode 2.x's plugin loader rejects the V1 file's function default export
  * (`Plugin must export a default definition with an id and an effect or setup
- * function`), so upstream has been INERT on this fleet's OpenCode 2 hosts:
+ * function`), so upstream has been INERT on the fleet's OpenCode 2 hosts:
  * fetched + cached at startup, then skipped at registration. This module
- * supplies the V2 entrypoint the 2.x loader wants:
+ * supplies the V2 entrypoint the 2.x loader wants, and is vendored by the
+ * nix-configs as ~/.config/opencode/plugins/opencode-delegated-access (the
+ * loader resolves a package's `<name>/server` exports subpath first, so the
+ * 2.x host loads THIS entry while "." keeps the V1 default for 1.x hosts).
  *
- *     import { define } from "@opencode-ai/plugin/v2/promise"
- *     export default define({ id: "opencode-delegated-access", setup })
+ * # Zero runtime dependencies — why this file re-implements small helpers
  *
- * The V1 entrypoint (`src/index.ts`, async-function default) stays untouched
- * and keeps working for OpenCode 1.x hosts.
+ * A vendored plugins/ directory lives under a path with NO ancestor
+ * node_modules chain (for the nix deployment that path is a /nix/store
+ * source dir). The loader resolves imports relative to the importing file,
+ * so any external VALUE import here dies with "Cannot find package".
+ * Everything below is therefore dependency-free: upstream's define() is a
+ * pure identity helper (packages/plugin/src/promise/plugin.ts) so we ship a
+ * local typed copy; config parsing mirrors config.ts's DEFAULT_CONFIG with
+ * per-field fallbacks; the bash/gh shell runner is a child_process shim
+ * standing in for the Bun `$` the V2 context lacks; and notifications go
+ * through Linux `notify-send` (node-notifier's rich-action behaviour is not
+ * portable through child_process here). Type-only imports (sdk/… shape
+ * declarations in local files) are erased at load and safe.
  *
  * # Mapping the V1 machinery onto the V2 (promise) plugin API
  *
@@ -39,35 +51,34 @@
  *     V2 user messages carry `text` directly and no `agent` field, so the
  *     rootAgent provenance filter is dropped; the strip-tag sanitizer is
  *     kept as defense-in-depth.
- *   - Post-ask resolution     → `ctx.permission.reply({ sessionID, requestID,
- *     decision })` behind the RISKY/failure notification buttons.
  *   - Reply/history events    → `ctx.event.subscribe({ types:
  *     ["permission.asked", "permission.replied"] })`; V2 replied shapes are
  *     normalised to the canonical { sessionID, permissionID, response } the
- *     shared `handlePermissionReplied` already consumes.
- *   - Repo context (git/gh)   → `childProcessShell()` shim standing in for
- *     the Bun `$` the V2 context doesn't provide (see v2-shell.ts).
+ *     shared approval-history handler consumes (re-implemented here locally
+ *     to keep the dependency-free contract).
+ *   - Repo context (git/gh)   → `childProcessShell()` shim in v2-shell.ts.
  *   - Logging                 → console with the "[delegated-access]"
- *     prefix (fire-and-forget, same degradation semantics as log.ts; the V2
- *     promise context has no `client.app.log`).
+ *     prefix (fire-and-forget; the V2 promise context has no
+ *     `client.app.log`).
  *
  * # Deliberate behaviour deltas vs V1 (documented — do not "fix" silently)
  *
  *   1. SAFE verdicts set `effect = "allow"` during evaluation: auto-approval
  *      is pre-prompt, so there is no live TUI prompt to cancel during the
- *      old `safeCountdownMs` window. The safe notification is therefore
- *      informational ("auto-approved"), and `safeCountdownMs` no longer gates
- *      approval timing on this path. All hard-RISKY categories still require
- *      the TUI prompt.
+ *      old `safeCountdownMs` window. All notifications are informational
+ *      (no Approve/Reject buttons — interactive notification action
+ *      callbacks are not portable here); RISKY and classifier-failure
+ *      subjects fall through to the engine's own "ask" and the human still
+ *      resolves them in the TUI.
  *   2. The session-model auto-detection uses the latest assistant message
- *      from the root session's context; the authoritative source remains
- *      `options.classifierModel` (our fleet deployment always sets it).
- *   3. The safe-notification batching (macOS single-notification window)
- *      is not ported; Linux notifier behaviour differs and the approval no
- *      longer races the notification.
+ *      from the root session's context; `options.classifierModel`
+ *      (delivered for tuple-config installs) remains authoritative.
+ *   3. Approval-recorded history: replies match the ask row via
+ *      permission.asked's permission id bridged from this evaluation
+ *      outcome (the evaluate input itself carries no row id).
  */
 
-import { parseConfig, type DelegatedAccessConfig } from "./config.ts"
+import type { DelegatedAccessConfig } from "./config.ts"
 import {
   CLASSIFIER_SYSTEM_PROMPT,
   buildClassifierUserPrompt,
@@ -77,15 +88,9 @@ import {
 import { parseVerdict, type Verdict } from "./classifier/parse.ts"
 import { resolveClassifierModel, type ModelRef } from "./classifier/model.ts"
 import { sanitizeUserMessageForClassifier } from "./ui/messages.ts"
-import {
-  handlePermissionReplied,
-} from "./index.ts"
 import { ApprovalHistoryStore } from "./permission/approval-history.ts"
 import { DirectoryVerdictCache } from "./permission/directory-cache.ts"
 import { PendingSubjectsMap } from "./permission/pending-subjects.ts"
-import {
-  FailureNotifyRateLimiter,
-} from "./permission/failure-notify.ts"
 import {
   isDualRepoContext,
   RepoContextCache,
@@ -93,27 +98,20 @@ import {
   type RepoContext,
 } from "./repo-context.ts"
 import { SessionRepoContext } from "./session-repo-context.ts"
-import { sendNotification } from "./notify/notify.ts"
 import { childProcessShell } from "./v2-shell.ts"
 
 // ---------------------------------------------------------------------------
 // Local `define` helper (promise-API compatible).
 //
-// NOTE: this intentionally does NOT import "@opencode-ai/plugin/v2/promise"
-// at runtime. The vendored-directory install (nix store path) has no ancestor
-// node_modules chain, so the entry must run with ZERO external value
-// imports. Upstream's define is literally `function define(plugin) { return
-// plugin; }` (packages/plugin/src/promise/plugin.ts and every meridian
-// bundle) — an identity helper whose only purpose is a typed object literal.
-// Keep the structural typing in sync if the loader's server-side schema
-// for the default definition ever grows new required fields.
+// Upstream's define is literally `function define(plugin) { return
+// plugin; }` — an identity helper whose only purpose is a typed object
+// literal. Keep the structural typing in sync if the loader's server-side
+// schema for the default definition ever grows new required fields.
 // ---------------------------------------------------------------------------
 
 /**
  * The server-side validation the OpenCode 2.x loader performs on the default
  * export: an object with a string `id` and a `setup` (or `effect`) function.
- * This type matches that surface without importing the (version-moving)
- * npm types at runtime; value shape is unchanged from the upstream helper.
  */
 export type PromisePluginDefinition = {
   id: string
@@ -152,12 +150,6 @@ export type V2PermissionDomain = {
     name: "evaluate",
     callback: (input: PermissionEvaluationLike) => Promise<void> | void,
   ) => Promise<RegistrationLike>
-  reply: (input: {
-    sessionID: string
-    requestID: string
-    decision: "once" | "always" | "reject"
-    message?: string
-  }) => Promise<unknown>
 }
 
 export type SessionMessageLike = {
@@ -284,7 +276,7 @@ export function evaluationToInfo(ev: PermissionEvaluationLike): EvaluationInfo {
 
 /**
  * Normalise a `permission.replied` event payload into the canonical shape
- * `handlePermissionReplied` consumes. V2 field names (requestID/reply) map
+ * the approval-history store consumes. V2 field names (requestID/reply) map
  * in; V1 names still win if both appear.
  */
 export function normalizeV2RepliedProperties(
@@ -312,6 +304,77 @@ export function normalizeV2RepliedProperties(
     sessionID: r.sessionID,
     permissionID,
     response,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Config defaults (zod-free — see the file header).
+// ---------------------------------------------------------------------------
+
+
+const V2_DEFAULT_NUMBERS = {
+  contextMessageCount: 3,
+  safeCountdownMs: 5_000,
+  classifierTimeoutMs: 15_000,
+  classifierRetries: 1,
+  directoryVerdictCacheTtlMs: 60_000,
+  approvalHistoryMax: 20,
+  classifierFailureNotifyCooldownMs: 60_000,
+}
+
+const V2_DEFAULT_BOOLEANS = {
+  enabled: true,
+  notificationSound: true,
+  externalDirectoryEnabled: true,
+  approvalHistoryEnabled: true,
+  notifyOnClassifierFailure: true,
+}
+
+/**
+ * Permissive numbers with clamping to the V1 zod ranges; unknown values
+ * fall back to the default. Mirrors config.ts's DEFAULT_CONFIG exactly.
+ */
+export function parseConfigV2(input: unknown): DelegatedAccessConfig {
+  const o =
+    input && typeof input === "object"
+      ? (input as Record<string, unknown>)
+      : {}
+  const num = (
+    key: keyof typeof V2_DEFAULT_NUMBERS,
+    min: number,
+    max: number,
+  ): number => {
+    const v = o[key]
+    return typeof v === "number" && Number.isFinite(v)
+      ? Math.min(max, Math.max(min, Math.round(v)))
+      : V2_DEFAULT_NUMBERS[key]
+  }
+  const bool = (key: keyof typeof V2_DEFAULT_BOOLEANS): boolean => {
+    const v = o[key]
+    return typeof v === "boolean" ? v : V2_DEFAULT_BOOLEANS[key]
+  }
+  return {
+    enabled: bool("enabled"),
+    contextMessageCount: num("contextMessageCount", 0, 20),
+    safeCountdownMs: num("safeCountdownMs", 0, 60_000),
+    classifierModel:
+      typeof o.classifierModel === "string" &&
+      o.classifierModel.trim().length > 0
+        ? o.classifierModel.trim()
+        : undefined,
+    classifierTimeoutMs: num("classifierTimeoutMs", 500, 60_000),
+    classifierRetries: num("classifierRetries", 0, 10),
+    notificationSound: bool("notificationSound"),
+    externalDirectoryEnabled: bool("externalDirectoryEnabled"),
+    directoryVerdictCacheTtlMs: num("directoryVerdictCacheTtlMs", 0, 300_000),
+    approvalHistoryEnabled: bool("approvalHistoryEnabled"),
+    approvalHistoryMax: num("approvalHistoryMax", 0, 1000),
+    notifyOnClassifierFailure: bool("notifyOnClassifierFailure"),
+    classifierFailureNotifyCooldownMs: num(
+      "classifierFailureNotifyCooldownMs",
+      0,
+      3_600_000,
+    ),
   }
 }
 
@@ -490,7 +553,10 @@ Classify the original subject again now.
  * Fold the classifier system prompt into the single string generate.text
  * accepts (the endpoint has no `system` field).
  */
-export function composeWithSystem(systemPrompt: string, userPrompt: string): string {
+export function composeWithSystem(
+  systemPrompt: string,
+  userPrompt: string,
+): string {
   return `${systemPrompt}\n\n---\n\n${userPrompt}`
 }
 
@@ -581,50 +647,170 @@ export async function raceTimeout<T>(
 }
 
 // ---------------------------------------------------------------------------
-// Post-ask notifications (risky / classifier-failure paths).
+// Data-only notifier (dependency-free): the Linux `notify-send` CLI, best
+// effort. Action buttons are deliberately NOT used (interactive notification
+// action callbacks are not portable here — see the file header); everything
+// resolves via the OpenCode TUI as usual.
 // ---------------------------------------------------------------------------
 
-/** One pending classification outcome waiting for the ask row to exist. */
-type BridgeEntry = {
-  kind: "risky" | "failure"
-  subject: string
-  subjectLabel: "command" | "path"
-  reason: string | null
-  failureClass?: "timeout" | "error"
-  suppressedCount?: number
-  sound: boolean
-}
-
-const APPROVE_LABEL = "Approve"
-const REJECT_LABEL = "Reject"
-const COMMAND_DISPLAY_MAX = 180
+const SUBJECT_DISPLAY_MAX = 140
 
 function displaySubject(subject: string, max: number): string {
   return subject.length > max ? subject.slice(0, max) + "…" : subject
 }
 
-async function replyToPermission(
-  permission: V2PermissionDomain,
-  sessionID: string,
-  requestID: string,
-  decision: "once" | "always" | "reject",
-  log: Logger,
-): Promise<void> {
+type NotifyArgs = {
+  title: string
+  message: string
+  /** Seconds the notification stays on screen (0 = server default). */
+  timeoutSec?: number
+}
+
+/** Best-effort `notify-send`. Never throws; returns void. */
+async function notifySend(args: NotifyArgs): Promise<void> {
+  const { title, message, timeoutSec } = args
   try {
-    await permission.reply({ sessionID, requestID, decision } as never)
-    log.info("notification reply resolved", {
-      sessionID,
-      requestID,
-      decision,
+    const { spawn } = await import("node:child_process")
+    const argv = [
+      title,
+      message,
+      ...(timeoutSec && timeoutSec > 0
+        ? ["-t", String(Math.min(2147483647, timeoutSec * 1000))]
+        : []),
+    ]
+    await new Promise<void>((resolve) => {
+      const child = spawn("notify-send", argv, {
+        stdio: ["ignore", "ignore", "ignore"],
+      })
+      child.on("error", () => resolve())
+      child.on("close", () => resolve())
     })
-  } catch (e) {
-    log.error("notification reply failed (TUI prompt stays as fallback)", {
-      sessionID,
-      requestID,
-      decision,
-      error: e instanceof Error ? e.message : String(e),
+  } catch {
+    // Notification failures must never affect the permission flow.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiter for classifier-failure notifications (mirror of
+// permission/failure-notify.ts's FailureNotifyRateLimiter — locals kept
+// dependency-free).
+// ---------------------------------------------------------------------------
+
+export type RateLimitDecision = {
+  notify: boolean
+  suppressedCount: number
+}
+
+/**
+ * At most ONE failure notification per cooldown window; a burst of failures
+ * during a sustained outage collapses into a single notification.
+ */
+export class V2FailureRateLimiter {
+  private readonly cooldownMs: number
+  private lastNotifyAt: number | null = null
+  private suppressedSinceLast = 0
+
+  constructor(opts: { cooldownMs: number }) {
+    this.cooldownMs = Math.max(0, opts.cooldownMs)
+  }
+
+  register(_failureClass: string, now: number): RateLimitDecision {
+    if (this.cooldownMs === 0) {
+      return { notify: true, suppressedCount: 0 }
+    }
+    if (
+      this.lastNotifyAt === null ||
+      now - this.lastNotifyAt >= this.cooldownMs
+    ) {
+      const suppressed = this.suppressedSinceLast
+      this.lastNotifyAt = now
+      this.suppressedSinceLast = 0
+      return { notify: true, suppressedCount: suppressed }
+    }
+    this.suppressedSinceLast++
+    return { notify: false, suppressedCount: 0 }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Approval-history capture (mirror of index.ts's handlePermissionReplied —
+// local copy keeps the dependency-free contract; the V1 function is
+// unchanged for the V1 path).
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure handler for `permission.replied` events over the canonical shape.
+ * Looks up the matching pending subject, filters OUR auto-approvals out,
+ * and appends a human-decision entry to the approval history.
+ */
+export function handleRepliedForHistory(
+  canonical: { sessionID: string; permissionID: string; response: string },
+  deps: {
+    pendingSubjects: PendingSubjectsMap
+    approvalHistory: ApprovalHistoryStore
+    config: DelegatedAccessConfig
+    log: Logger
+  },
+): void {
+  const { pendingSubjects, approvalHistory, config, log } = deps
+  const now = Date.now()
+
+  if (!config.approvalHistoryEnabled) {
+    log.debug("permission.replied: history disabled", {
+      permissionID: canonical.permissionID,
+    })
+    return
+  }
+
+  const pending = pendingSubjects.take(canonical.permissionID)
+  if (!pending) {
+    log.debug("permission.replied: no pending subject for permissionID", {
+      permissionID: canonical.permissionID,
+    })
+    return
+  }
+
+  if (pending.autoApproved) {
+    log.debug("permission.replied: skipping our own auto-approval", {
+      permissionID: canonical.permissionID,
+      subject: pending.subject,
+    })
+    return
+  }
+
+  const response = canonical.response
+  if (response !== "once" && response !== "always" && response !== "reject") {
+    log.warn("permission.replied: unrecognised response value", {
+      permissionID: canonical.permissionID,
+      response,
+    })
+    return
+  }
+
+  if (pending.classifierVerdict === null) {
+    log.info("permission.replied: human resolved before classifier", {
+      permissionID: canonical.permissionID,
+      response,
     })
   }
+
+  approvalHistory.record(pending.rootSessionID, {
+    subject: pending.subject,
+    subjectLabel: pending.subjectLabel,
+    response,
+    classifierVerdict: pending.classifierVerdict ?? "RISKY",
+    classifierReason:
+      pending.classifierReason ??
+      "(classifier did not complete before human resolved)",
+    timestamp: now,
+  })
+
+  log.info("recorded human approval decision", {
+    rootSessionID: pending.rootSessionID,
+    permissionID: canonical.permissionID,
+    response,
+    subject: pending.subject,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -636,14 +822,23 @@ type V2SharedState = {
   log: Logger
   session: V2SessionDomain | undefined
   generate: GenerateDomainLike | undefined
-  permission: V2PermissionDomain | undefined
   directoryVerdictCache: DirectoryVerdictCache
   approvalHistory: ApprovalHistoryStore
   pendingSubjects: PendingSubjectsMap
-  failureNotifyRateLimiter: FailureNotifyRateLimiter
+  failureNotifyRateLimiter: V2FailureRateLimiter
   getRepoContext: () => Promise<DualRepoContext | RepoContext | null>
-  pushBridge: (key: string, entry: BridgeEntry) => void
+  /** key → queue of classify outcomes, consumed by permission.asked. */
+  pushRowBridge: (key: string, entry: RowBridgeEntry) => void
+  takeRowBridge: (key: string) => RowBridgeEntry | undefined
   bridgeKey: (sessionID: string, action: string, resources: string[]) => string
+}
+
+/** A resolved classify outcome waiting for the ask row's permission ID. */
+type RowBridgeEntry = {
+  subject: string
+  subjectLabel: "command" | "path"
+  classifierVerdict: "SAFE" | "RISKY" | null
+  classifierReason: string | null
 }
 
 /** The evaluate callback — the core of the V2 plugin. */
@@ -659,9 +854,8 @@ export async function evaluatePermission(
     resources: ev.resources,
   }
 
-  // The conversation context only understands bash + external_directory
-  // classification; everything else falls through. We never touch `effect`
-  // for those, so the engine's own default (from the ruleset) applies.
+  // Only bash + external_directory are classified; other actions fall
+  // through untouched so the engine's own ruleset default applies.
   const isBash = BASH_ACTION_MATCHES.has(ev.action)
   const isDirectory = ev.action === EXTERNAL_DIRECTORY_ACTION
   if (!isBash && !isDirectory) {
@@ -804,15 +998,17 @@ export async function evaluatePermission(
       notify: decision.notify,
       suppressedCount: decision.suppressedCount,
     })
-    if (decision.notify) {
-      deps.pushBridge(deps.bridgeKey(info.sessionID, ev.action, info.patterns), {
-        kind: "failure",
-        subject: info.command,
-        subjectLabel: info.subjectLabel,
-        reason: null,
-        failureClass: result.failureClass,
-        suppressedCount: decision.suppressedCount,
-        sound: config.notificationSound,
+    if (config.notifyOnClassifierFailure && decision.notify) {
+      void notifySend({
+        title: `delegated-access: classifier ${
+          result.failureClass === "timeout" ? "timed out" : "error"
+        } — review in TUI`,
+        message: `${displaySubject(info.command, 160)}${
+          decision.suppressedCount > 0
+            ? ` (${decision.suppressedCount + 1} recent failures)`
+            : ""
+        }`,
+        timeoutSec: 60,
       })
     }
     return
@@ -837,32 +1033,31 @@ export async function evaluatePermission(
       }
     }
     applyAllow(ev, verdict.reason)
-    void notifySafePath({
-      config,
-      log,
-      subject: info.command,
-      reason: verdict.reason,
-    })
+    if (config.notificationSound) {
+      void notifySend({
+        title: "delegated-access: auto-approving",
+        message: `${displaySubject(info.command, SUBJECT_DISPLAY_MAX)} — ${verdict.reason}`,
+      })
+    }
     return
   }
 
-  // RISKY — leave the engine default ("ask") and bridge the ask row's ID so
-  // the Approve/Reject notification can resolve it once permission.asked
-  // hands it to us.
+  // RISKY — leave the engine default ("ask"), inform the human, and bridge
+  // the ask row's permission ID so the reply event can record the decision.
   log.info("evaluate: risky — escalating via TUI + notification", base)
-  deps.pushBridge(deps.bridgeKey(info.sessionID, ev.action, info.patterns), {
-    kind: "risky",
+  if (config.notificationSound) {
+    void notifySend({
+      title: "delegated-access: risky subject — review in TUI",
+      message: `${displaySubject(info.command, SUBJECT_DISPLAY_MAX)} — ${verdict.reason}`,
+      timeoutSec: 60,
+    })
+  }
+  deps.pushRowBridge(deps.bridgeKey(info.sessionID, ev.action, info.patterns), {
     subject: info.command,
     subjectLabel: info.subjectLabel,
-    reason: verdict.reason,
-    sound: config.notificationSound,
+    classifierVerdict: "RISKY",
+    classifierReason: verdict.reason,
   })
-}
-
-function isExperiApprovalAvailable(
-  deps: Pick<V2SharedState, "approvalHistory">,
-): boolean {
-  return typeof deps.approvalHistory.recent === "function"
 }
 
 function pickBranch(
@@ -885,51 +1080,18 @@ export function applyAllow(ev: PermissionEvaluationLike, reason: string): void {
   mutable.message = `delegated-access: auto-approved — ${reason}`.slice(0, 300)
 }
 
-/** Fire-and-forget informational notification for an auto-approval. */
-async function notifySafePath(args: {
-  config: DelegatedAccessConfig
-  log: Logger
-  subject: string
-  reason: string
-}): Promise<void> {
-  const { config, log, subject, reason } = args
-  try {
-    await sendNotification({
-      title: "delegated-access: auto-approving",
-      message: `${displaySubject(subject, 140)} — ${reason}`,
-      sound: config.notificationSound,
-    })
-    log.info("safe notification posted", {
-      subject: displaySubject(subject, 140),
-    })
-  } catch (e) {
-    log.debug("safe notification failed (approval unaffected)", {
-      error: e instanceof Error ? e.message : String(e),
-    })
-  }
-}
-
 // ---------------------------------------------------------------------------
 // The V2 plugin definition.
 // ---------------------------------------------------------------------------
 
 /**
- * The V2 default definition. Same id as the package name so server-side
- * dedupe/logging stays greppable against the V1 naming.
- */
-export type V2Setup = {
-  id: string
-  setup: (context: unknown) => Promise<(() => Promise<void>) | void>
-}
-
-/**
  * The V2 default definition. Same id as the package so server-side
- * dedupe/logs stay greppable against the V1 naming.
+ * dedupe/logging stays greppable against the V1 naming.
  *
- * Typing note: the shipped @opencode-ai/plugin 1.19.5 .d.ts narrows `setup`'s
- * result to `void | Promise<void>` — the runtime (and the server adapter)
- * treat an async-function return as a cleanup/dispose awaitable, and that is
- * what this setup returns. The narrow type is erased here rather than
+ * Typing note: the shipped @opencode-ai/plugin .d.ts narrows `setup`'s
+ * result to `void | Promise<void>` — the server runtime (and the promise
+ * adapter) treats an async-function return as a cleanup/dispose awaitable,
+ * which is what this setup returns; the narrow type is erased rather than
  * importing broader (as-yet-unpublished) context types.
  */
 export const DelegatedAccessV2 = define({
@@ -940,389 +1102,300 @@ export const DelegatedAccessV2 = define({
 async function setupImpl(
   hostContext: unknown,
 ): Promise<(() => Promise<void>) | void> {
-    const ctx = hostContext as V2PluginContext
-    const log = consoleLogger()
+  const ctx = hostContext as V2PluginContext
+  const log = consoleLogger()
 
-    const worktree =
-      (ctx.location && typeof ctx.location.directory === "string"
-        ? ctx.location.directory
-        : undefined) ?? process.cwd()
-    const shell = childProcessShell()
+  const worktree =
+    (ctx.location && typeof ctx.location.directory === "string"
+      ? ctx.location.directory
+      : undefined) ?? process.cwd()
+  const shell = childProcessShell()
 
-    // Live repo-context cache (same TTL + in-flight coalescing as V1) over
-    // the child-process shell shim, plus the session-pinned snapshot that
-    // shares the first fetch through the cache.
-    const repoContextCache = new RepoContextCache({ $: shell })
-    const sessionRepoContext = new SessionRepoContext({
+  // Live repo-context cache (same TTL + in-flight coalescing as V1) over
+  // the child-process shell shim, plus the session-pinned snapshot that
+  // shares the first fetch through the cache.
+  const repoContextCache = new RepoContextCache({ $: shell })
+  const sessionRepoContext = new SessionRepoContext({
+    worktree,
+    fetcher: (cwd) => repoContextCache.get(cwd),
+  })
+
+  // Config: parse options (tuple-config installs deliver them here;
+  // vendored-dir installs deliver nothing → defaults).
+  let config: DelegatedAccessConfig
+  try {
+    config = parseConfigV2(ctx.options)
+    log.info("v2 plugin loaded", {
       worktree,
-      fetcher: (cwd) => repoContextCache.get(cwd),
+      enabled: config.enabled,
+      classifierModel: config.classifierModel,
+      contextMessageCount: config.contextMessageCount,
+      classifierTimeoutMs: config.classifierTimeoutMs,
+      classifierRetries: config.classifierRetries,
+      externalDirectoryEnabled: config.externalDirectoryEnabled,
+      approvalHistoryEnabled: config.approvalHistoryEnabled,
+      safeCountdownMs: config.safeCountdownMs,
     })
+  } catch (e) {
+    config = parseConfigV2(undefined)
+    log.warn("invalid plugin options; using defaults", {
+      error: e instanceof Error ? e.message : String(e),
+    })
+  }
 
-    // Config: parse options exactly like V1 (options object → defaults on
-    // invalid shapes).
-    let config: DelegatedAccessConfig
+  // Shared state — same instance contracts the V1 factory built.
+  const directoryVerdictCache = new DirectoryVerdictCache()
+  const approvalHistory = new ApprovalHistoryStore({
+    maxPerSession: config.approvalHistoryMax,
+  })
+  const pendingSubjects = new PendingSubjectsMap()
+  const failureNotifyRateLimiter = new V2FailureRateLimiter({
+    cooldownMs: config.classifierFailureNotifyCooldownMs,
+  })
+
+  // Bridge: rows the classifier adjudicated, waiting for the ask row's
+  // permission ID from `permission.asked` (so replies can record history).
+  const rowBridges = new Map<string, RowBridgeEntry[]>()
+  const ROW_BRIDGE_TTL_MS = 60_000
+  const bridgeAges = new Map<string, number>()
+
+  function buildBridgeKey(
+    sessionID: string,
+    action: string,
+    resources: string[],
+  ): string {
+    return `${sessionID}::${action}::${resources.join("|")}`
+  }
+
+  function pushRowBridge(key: string, entry: RowBridgeEntry): void {
+    const now = Date.now()
+    for (const [k, age] of bridgeAges) {
+      if (now - age > ROW_BRIDGE_TTL_MS) {
+        bridgeAges.delete(k)
+        rowBridges.delete(k)
+      }
+    }
+    const list = rowBridges.get(key) ?? []
+    list.push(entry)
+    rowBridges.set(key, list)
+    bridgeAges.set(key, now)
+    log.debug("row bridge pushed", { key })
+  }
+
+  function takeRowBridge(key: string): RowBridgeEntry | undefined {
+    const list = rowBridges.get(key)
+    const entry = list?.shift()
+    if (list && list.length === 0) {
+      rowBridges.delete(key)
+      bridgeAges.delete(key)
+    } else if (list) {
+      bridgeAges.set(key, Date.now())
+    }
+    return entry
+  }
+
+  const deps: V2SharedState = {
+    config,
+    log,
+    session: ctx.session,
+    generate: ctx.experimental?.generate ?? ctx.generate,
+    directoryVerdictCache,
+    approvalHistory,
+    pendingSubjects,
+    failureNotifyRateLimiter,
+    getRepoContext: async () => {
+      const [pinned, current] = await Promise.all([
+        sessionRepoContext.getPinned(),
+        repoContextCache.get(worktree),
+      ])
+      if (pinned === null && current === null) return null
+      return { pinned, current }
+    },
+    pushRowBridge,
+    takeRowBridge,
+    bridgeKey: buildBridgeKey,
+  }
+
+  // ---- Permission evaluation hook --------------------------------------
+  let evaluateRegistration: RegistrationLike | undefined
+  if (
+    config.enabled &&
+    ctx.permission &&
+    typeof ctx.permission.hook === "function"
+  ) {
     try {
-      config = parseConfig(ctx.options)
-      log.info("v2 plugin loaded", {
-        worktree,
-        enabled: config.enabled,
-        classifierModel: config.classifierModel,
-        contextMessageCount: config.contextMessageCount,
-        classifierTimeoutMs: config.classifierTimeoutMs,
-        classifierRetries: config.classifierRetries,
-        externalDirectoryEnabled: config.externalDirectoryEnabled,
-        approvalHistoryEnabled: config.approvalHistoryEnabled,
-        safeCountdownMs: config.safeCountdownMs,
-      })
+      const registration = await ctx.permission.hook("evaluate", (ev) =>
+        evaluatePermission(ev, {
+          ...deps,
+          bridgeKey: buildBridgeKey,
+          pushRowBridge,
+          takeRowBridge,
+        }),
+      )
+      evaluateRegistration = registration
+      log.info("permission evaluate hook registered", {})
     } catch (e) {
-      config = parseConfig(undefined)
-      log.warn("invalid plugin options; using defaults", {
+      log.warn(
+        "permission.hook('evaluate') registration failed — plugin inert",
+        { error: e instanceof Error ? e.message : String(e) },
+      )
+    }
+  } else if (!config.enabled) {
+    log.info("plugin disabled via options; evaluate hook not registered", {})
+  } else {
+    log.warn("ctx.permission.hook unavailable — plugin inert", {})
+  }
+
+  // ---- Event loop (asked / replied) — history capture only --------------
+  const controller = new AbortController()
+  if (ctx.event && typeof ctx.event.subscribe === "function") {
+    try {
+      const events = ctx.event.subscribe({
+        types: ["permission.asked", "permission.replied"],
+        signal: controller.signal,
+      } as never) as AsyncIterable<Record<string, unknown>>
+
+      void (async () => {
+        for await (const event of events) {
+          await handleMessageEvent(event)
+        }
+      })().catch((e: unknown) => {
+        if (controller.signal.aborted) return
+        log.error("event stream ended unexpectedly", {
+          error: e instanceof Error ? e.message : String(e),
+        })
+      })
+      log.info("event subscription established", {})
+    } catch (e) {
+      log.warn("event subscription failed (history capture disabled)", {
         error: e instanceof Error ? e.message : String(e),
       })
     }
+  } else {
+    log.warn("ctx.event.subscribe unavailable; history capture disabled", {})
+  }
 
-    // Shared state — same instance contracts the V1 factory built.
-    const directoryVerdictCache = new DirectoryVerdictCache()
-    const approvalHistory = new ApprovalHistoryStore({
-      maxPerSession: config.approvalHistoryMax,
-    })
-    const pendingSubjects = new PendingSubjectsMap()
-    const failureNotifyRateLimiter = new FailureNotifyRateLimiter({
-      cooldownMs: config.classifierFailureNotifyCooldownMs,
-    })
+  /**
+   * Event payload wrapper: OpenCode event objects are encoded as
+   * `{ id, created, metadata, type, data }` (V2) while earlier surfaces
+   * used `.properties`. Probe both, then the event itself.
+   */
+  function eventPayloadOf(event: Record<string, unknown>): unknown {
+    if ("data" in event) return event.data
+    if ("properties" in event) return event.properties
+    return event
+  }
 
-    const deps: V2SharedState = {
-      config,
-      log,
-      session: ctx.session,
-      generate: ctx.experimental?.generate ?? ctx.generate,
-      permission: ctx.permission,
-      directoryVerdictCache,
-      approvalHistory,
-      pendingSubjects,
-      failureNotifyRateLimiter,
-      getRepoContext: async () => {
-        const [pinned, current] = await Promise.all([
-          sessionRepoContext.getPinned(),
-          repoContextCache.get(worktree),
-        ])
-        if (pinned === null && current === null) return null
-        return { pinned, current }
-      },
-      pushBridge: pushBridgeEntry,
-      bridgeKey: buildBridgeKey,
-    }
-
-    // Bridge: entries awaiting the permission ID the ask row gets.
-    const bridges = new Map<string, BridgeEntry[]>()
-    const BRIDGE_TTL_MS = 60_000
-    const bridgeAges = new Map<string, number>()
-
-    function buildBridgeKey(
-      sessionID: string,
-      action: string,
-      resources: string[],
-    ): string {
-      return `${sessionID}::${action}::${resources.join("|")}`
-    }
-
-    function pushBridgeEntry(key: string, entry: BridgeEntry): void {
-      const now = Date.now()
-      // Sweep stale entries so long-lived sessions can't grow the map.
-      for (const [k, age] of bridgeAges) {
-        if (now - age > BRIDGE_TTL_MS) {
-          bridgeAges.delete(k)
-          bridges.delete(k)
-        }
-      }
-      const list = bridges.get(key) ?? []
-      list.push(entry)
-      bridges.set(key, list)
-      bridgeAges.set(key, now)
-      log.debug("bridge entry pushed", { key, kind: entry.kind })
-    }
-
-    function takeBridgeEntry(key: string): BridgeEntry | undefined {
-      const list = bridges.get(key)
-      const entry = list?.shift()
-      if (list && list.length === 0) {
-        bridges.delete(key)
-        bridgeAges.delete(key)
-      } else if (list) {
-        bridgeAges.set(key, Date.now())
-      }
-      return entry
-    }
-
-    // ---- Permission evaluation hook --------------------------------------
-    let evaluateRegistration: RegistrationLike | undefined
-    if (
-      config.enabled &&
-      ctx.permission &&
-      typeof ctx.permission.hook === "function"
-    ) {
-      try {
-        const registration = await ctx.permission.hook("evaluate", (ev) =>
-          evaluatePermission(ev, {
-            ...deps,
-            bridgeKey: buildBridgeKey,
-            pushBridge: pushBridgeEntry,
-          }),
-        )
-        evaluateRegistration = registration
-        log.info("permission evaluate hook registered", {})
-      } catch (e) {
-        log.warn(
-          "permission.hook('evaluate') registration failed — plugin inert",
-          { error: e instanceof Error ? e.message : String(e) },
-        )
-      }
-    } else if (!config.enabled) {
-      log.info("plugin disabled via options; evaluate hook not registered", {})
-    } else {
-      log.warn("ctx.permission.hook unavailable — plugin inert", {})
-    }
-
-    // ---- Event loop (asked / replied) ------------------------------------
-    const controller = new AbortController()
-    if (ctx.event && typeof ctx.event.subscribe === "function") {
-      try {
-        const events = ctx.event.subscribe({
-          types: ["permission.asked", "permission.replied"],
-          signal: controller.signal,
-        } as never) as AsyncIterable<Record<string, unknown>>
-
-        void (async () => {
-          for await (const event of events) {
-            await handleMessageEvent(event)
-          }
-        })().catch((e: unknown) => {
-          if (controller.signal.aborted) return
-          log.error("event stream ended unexpectedly", {
-            error: e instanceof Error ? e.message : String(e),
+  async function handleMessageEvent(
+    rawEvent: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      if (!rawEvent || typeof rawEvent !== "object") return
+      const type = rawEvent.type
+      if (type === "permission.asked") {
+        const data = eventPayloadOf(rawEvent) as
+          | {
+              sessionID?: unknown
+              action?: unknown
+              resources?: unknown
+              id?: unknown
+            }
+          | undefined
+        if (
+          !data ||
+          typeof data !== "object" ||
+          typeof data.sessionID !== "string" ||
+          typeof data.action !== "string" ||
+          typeof data.id !== "string"
+        ) {
+          log.debug("permission.asked: unusable payload", {
+            raw: data as unknown,
           })
-        })
-        log.info("event subscription established", {})
-      } catch (e) {
-        log.warn("event subscription failed (history capture disabled)", {
-          error: e instanceof Error ? e.message : String(e),
-        })
-      }
-    } else {
-      log.warn("ctx.event.subscribe unavailable; history capture disabled", {})
-    }
-
-    // Event payload wrapper: OpenCode event objects are encoded as
-    // `{ id, created, metadata, type, data }` (V2) while earlier surfaces
-    // used `.properties`. Probe both, then the event itself.
-    function eventPayloadOf(event: Record<string, unknown>): unknown {
-      if ("data" in event) return event.data
-      if ("properties" in event) return event.properties
-      return event
-    }
-
-    async function handleMessageEvent(
-      rawEvent: Record<string, unknown>,
-    ): Promise<void> {
-      try {
-        const type = rawEvent?.type
-        if (type === "permission.asked") {
-          const data = eventPayloadOf(rawEvent) as
-            | {
-                sessionID?: unknown
-                action?: unknown
-                resources?: unknown
-                id?: unknown
-              }
-            | undefined
-          if (
-            !data ||
-            typeof data !== "object" ||
-            typeof data.sessionID !== "string" ||
-            typeof data.action !== "string" ||
-            typeof data.id !== "string"
-          ) {
-            log.debug("permission.asked: unusable payload", {
-              raw: data as unknown,
-            })
-            return
-          }
-          const resources = Array.isArray(data.resources)
-            ? (data.resources as unknown[]).filter(
-                (r): r is string => typeof r === "string",
-              )
-            : []
-          // Extract into typed consts BEFORE the fire-and-forget closures so
-          // TS's property-narrowing limitations can't bite inside them.
-          type AskRow = {
-            sessionID: string
-            action: string
-            id: string
-            resources: string[]
-          }
-          const ask: AskRow = {
-            sessionID: data.sessionID,
-            action: data.action,
-            id: data.id,
-            resources,
-          }
-          const key = buildBridgeKey(ask.sessionID, ask.action, ask.resources)
-          const entry = takeBridgeEntry(key)
-          if (!entry) {
-            log.debug("permission.asked: no pending bridge entry", {
-              sessionID: ask.sessionID,
-              action: ask.action,
-              permissionID: ask.id,
-            })
-            return
-          }
-          log.info("consumed bridge entry for ask row", {
+          return
+        }
+        const resources = Array.isArray(data.resources)
+          ? (data.resources as unknown[]).filter(
+              (r): r is string => typeof r === "string",
+            )
+          : []
+        const ask = {
+          sessionID: data.sessionID,
+          action: data.action,
+          id: data.id,
+          resources,
+        }
+        const key = buildBridgeKey(ask.sessionID, ask.action, ask.resources)
+        const entry = takeRowBridge(key)
+        if (!entry) {
+          log.debug("permission.asked: no pending row bridge entry", {
+            sessionID: ask.sessionID,
+            action: ask.action,
             permissionID: ask.id,
-            kind: entry.kind,
-            subject: displaySubject(entry.subject, 120),
-          })
-          pendingSubjects.set(ask.id, {
-            rootSessionID: ask.sessionID,
-            subject: entry.subject,
-            subjectLabel: entry.subjectLabel,
-            classifierVerdict: entry.kind === "risky" ? "RISKY" : null,
-            classifierReason: entry.reason,
-            autoApproved: false,
-          })
-          if (entry.kind === "risky") {
-            void (async () => {
-              try {
-                const result = await sendNotification({
-                  title: "delegated-access: review " + entry.subjectLabel,
-                  message: `${displaySubject(entry.subject, COMMAND_DISPLAY_MAX)} (${entry.reason})`,
-                  actions: [APPROVE_LABEL, REJECT_LABEL],
-                  sound: entry.sound,
-                  timeoutSec: 60,
-                })
-                if (result.type !== "action") return
-                const decision =
-                  result.label === APPROVE_LABEL
-                    ? "once"
-                    : result.label === REJECT_LABEL
-                      ? "reject"
-                      : undefined
-                if (
-                  decision === undefined ||
-                  typeof ctx.permission?.reply !== "function"
-                ) {
-                  return
-                }
-                await replyToPermission(
-                  ctx.permission,
-                  ask.sessionID,
-                  ask.id,
-                  decision,
-                  log,
-                )
-              } catch (e) {
-                log.warn("risky notification flow failed (TUI stays)", {
-                  permissionID: ask.id,
-                  error: e instanceof Error ? e.message : String(e),
-                })
-              }
-            })()
-          } else {
-            // Classifier-failure notification: Reject-only, one-shot.
-            void (async () => {
-              try {
-                const classLabel =
-                  entry.failureClass === "timeout"
-                    ? "classifier timed out"
-                    : "classifier error"
-                const burstSuffix =
-                  (entry.suppressedCount ?? 0) > 0
-                    ? ` (${(entry.suppressedCount ?? 0) + 1} recent failures)`
-                    : ""
-                const result = await sendNotification({
-                  title: `delegated-access: ${classLabel} — review in TUI`,
-                  message: `${displaySubject(entry.subject, 160)}${burstSuffix}`,
-                  actions: [REJECT_LABEL],
-                  sound: entry.sound,
-                  timeoutSec: 60,
-                })
-                if (
-                  result.type === "action" &&
-                  result.label === REJECT_LABEL &&
-                  typeof ctx.permission?.reply === "function"
-                ) {
-                  await replyToPermission(
-                    ctx.permission,
-                    ask.sessionID,
-                    ask.id,
-                    "reject",
-                    log,
-                  )
-                }
-              } catch (e) {
-                log.warn("failure notification flow failed (TUI stays)", {
-                  permissionID: ask.id,
-                  error: e instanceof Error ? e.message : String(e),
-                })
-              }
-            })()
-          }
-          return
-        }
-
-        if (type === "permission.replied") {
-          const canonical = normalizeV2RepliedProperties(
-            eventPayloadOf(rawEvent),
-          )
-          if (canonical === null) {
-            log.warn("permission.replied: malformed event shape", {
-              rawEvent: Object.keys(rawEvent ?? {}),
-            })
-            return
-          }
-          handlePermissionReplied(canonical, {
-            pendingSubjects,
-            approvalHistory,
-            config,
-            log: v1LoggerAdapter(log),
           })
           return
         }
-      } catch (e) {
-        log.error("event handling threw", {
-          error: e instanceof Error ? e.message : String(e),
+        pendingSubjects.set(ask.id, {
+          rootSessionID: ask.sessionID,
+          subject: entry.subject,
+          subjectLabel: entry.subjectLabel,
+          classifierVerdict: entry.classifierVerdict,
+          classifierReason: entry.classifierReason,
+          autoApproved: false,
         })
+        log.info("consumed row bridge entry for ask row", {
+          permissionID: ask.id,
+          subject: displaySubject(entry.subject, 120),
+          verdict: entry.classifierVerdict,
+        })
+        return
       }
-    }
 
-    log.info("v2 setup complete", {
-      evaluateHook: Boolean(evaluateRegistration),
-      eventStream: Boolean(ctx.event),
-    })
-
-    // ---- Cleanup ----------------------------------------------------------
-    return async () => {
-      controller.abort()
-      if (evaluateRegistration) {
-        try {
-          await evaluateRegistration.dispose()
-        } catch {
-          // Dispose is best-effort.
+      if (type === "permission.replied") {
+        const canonical = normalizeV2RepliedProperties(
+          eventPayloadOf(rawEvent),
+        )
+        if (canonical === null) {
+          log.warn("permission.replied: malformed event shape", {
+            keys: Object.keys(rawEvent ?? {}),
+          })
+          return
         }
+        handleRepliedForHistory(canonical, {
+          pendingSubjects,
+          approvalHistory,
+          config,
+          log,
+        })
+        return
       }
-      log.info("v2 plugin unloaded; event stream aborted", {})
+    } catch (e) {
+      log.error("event handling threw", {
+        error: e instanceof Error ? e.message : String(e),
+      })
     }
   }
 
-/**
- * The V2 Logger and the V1 Logger are structurally identical (same method
- * signatures) — adapt only the branding so V1 handler lines match V1 greps.
- */function v1LoggerAdapter(log: Logger): import("./log.ts").Logger {
-  return {
-    debug: (m, e) => log.debug(m, e),
-    info: (m, e) => log.info(m, e),
-    warn: (m, e) => log.warn(m, e),
-    error: (m, e) => log.error(m, e),
+  log.info("v2 setup complete", {
+    evaluateHook: Boolean(evaluateRegistration),
+    eventStream: Boolean(ctx.event),
+  })
+
+  // ---- Cleanup ----------------------------------------------------------
+  return async () => {
+    controller.abort()
+    if (evaluateRegistration) {
+      try {
+        await evaluateRegistration.dispose()
+      } catch {
+        // Dispose is best-effort.
+      }
+    }
+    log.info("v2 plugin unloaded; event stream aborted", {})
   }
 }
 
+/**
+ * The V2 Logger and the V1 Logger are structurally identical — adapt only
+ * the module branding so shared V1 helper log lines still grep as V1.
+ */
 export default DelegatedAccessV2
